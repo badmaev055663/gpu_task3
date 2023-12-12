@@ -61,30 +61,52 @@ struct OpenCL {
     cl::CommandQueue queue;
 };
 
-void profile_filter(int n) {
+void profile_filter(int n, OpenCL& opencl) {
     auto input = random_std_vector<float>(n);
-    std::vector<float> result, expected_result(n);
+    int local_sz = 256, res_size[1];
+    std::vector<float> result, result_gpu;
     result.reserve(n);
+    result_gpu.reserve(n);
+    cl::Kernel kernel(opencl.program, "filter");
     auto t0 = clock_type::now();
     filter(input, result, [] (float x) { return x > 0; }); // filter positive numbers
     auto t1 = clock_type::now();
+    cl::Buffer d_input(opencl.queue, begin(input), end(input), false);
+    cl::Buffer d_res_size(opencl.context, CL_MEM_READ_WRITE, sizeof(size_t));
+    cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, result_gpu.capacity()*sizeof(float));
+    opencl.queue.finish();
+    kernel.setArg(0, d_input);
+    kernel.setArg(1, d_res_size);
+    kernel.setArg(2, d_result);
+    opencl.queue.flush();
     auto t2 = clock_type::now();
+    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n), cl::NDRange(local_sz));
+    opencl.queue.flush();
     auto t3 = clock_type::now();
+    cl::copy(opencl.queue, d_res_size, std::begin(res_size), std::end(res_size));
+    cl::copy(opencl.queue, d_result, std::begin(result_gpu), std::begin(result_gpu) + res_size[0]);
+    result_gpu.resize(res_size[0]);
     auto t4 = clock_type::now();
-    // TODO Implement OpenCL version! See profile_vector_times_vector for an example.
-    // TODO Uncomment the following line!
-    //verify_vector(expected_result, result);
+    verify_vector(result, result_gpu);
     print("filter", {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3});
 }
 
 void opencl_main(OpenCL& opencl) {
     using namespace std::chrono;
     print_column_names();
-    profile_filter(1024*1024);
+    profile_filter(1024*1024, opencl);
 }
 
 const std::string src = R"(
-// TODO: Create OpenCL kernels.
+__kernel void filter(global const float *input,
+                    global int *res_size,
+                    global float *result) {
+    const int i = get_global_id(0);
+    const int n = get_global_size(0);
+    int t = get_local_id(0);
+    if (i == 0)
+        res_size[0] = n;
+}
 )";
 
 int main() {
