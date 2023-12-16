@@ -63,29 +63,26 @@ struct OpenCL {
 
 void profile_filter(int n, OpenCL& opencl) {
     auto input = random_std_vector<float>(n);
-    int local_sz = 256, res_size[1];
+    int local_sz = 256;
+    std::vector<int> bins(n / local_sz);
     std::vector<float> result, result_gpu;
     result.reserve(n);
     result_gpu.reserve(n);
-    cl::Kernel kernel(opencl.program, "filter");
+    cl::Kernel cnt_pos_kernel(opencl.program, "count_positive");
     auto t0 = clock_type::now();
     filter(input, result, [] (float x) { return x > 0; }); // filter positive numbers
     auto t1 = clock_type::now();
     cl::Buffer d_input(opencl.queue, begin(input), end(input), false);
-    cl::Buffer d_res_size(opencl.context, CL_MEM_READ_WRITE, sizeof(size_t));
-    cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, result_gpu.capacity()*sizeof(float));
+    cl::Buffer d_bins(opencl.context, CL_MEM_READ_WRITE, bins.size()*sizeof(int));
     opencl.queue.finish();
-    kernel.setArg(0, d_input);
-    kernel.setArg(1, d_res_size);
-    kernel.setArg(2, d_result);
+    cnt_pos_kernel.setArg(0, d_input);
+    cnt_pos_kernel.setArg(1, d_bins);
     opencl.queue.flush();
     auto t2 = clock_type::now();
-    opencl.queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(n), cl::NDRange(local_sz));
+    opencl.queue.enqueueNDRangeKernel(cnt_pos_kernel, cl::NullRange, cl::NDRange(n), cl::NDRange(local_sz));
     opencl.queue.flush();
     auto t3 = clock_type::now();
-    cl::copy(opencl.queue, d_res_size, std::begin(res_size), std::end(res_size));
-    cl::copy(opencl.queue, d_result, std::begin(result_gpu), std::begin(result_gpu) + res_size[0]);
-    result_gpu.resize(res_size[0]);
+    cl::copy(opencl.queue, d_bins, std::begin(bins), std::end(bins));
     auto t4 = clock_type::now();
     verify_vector(result, result_gpu);
     print("filter", {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3});
@@ -98,7 +95,8 @@ void opencl_main(OpenCL& opencl) {
 }
 
 const std::string src = R"(
-__kernel void filter(global const float *input,
+#define BUFFSIZE 1024
+kernel void filter(global const float *input,
                     global int *res_size,
                     global float *result) {
     const int i = get_global_id(0);
@@ -106,6 +104,26 @@ __kernel void filter(global const float *input,
     int t = get_local_id(0);
     if (i == 0)
         res_size[0] = n;
+}
+
+kernel void count_positive(global const float *a,
+                    global int *result) {
+    const int m = get_local_size(0);
+    int k = get_group_id(0);
+    int t = get_local_id(0);
+    local float buff[BUFFSIZE];
+
+    buff[t] = a[k * m + t];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (t == 0) {
+        int cnt = 0;
+        for (int j = 0; j < m; j++) {
+            if (buff[j] > 0)
+                cnt++;
+        }
+        result[k] = cnt;
+    }
 }
 )";
 
