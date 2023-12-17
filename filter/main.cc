@@ -64,34 +64,36 @@ struct OpenCL {
 void profile_filter(int n, OpenCL& opencl) {
     auto input = random_std_vector<float>(n);
     int local_sz = 256;
-    std::vector<int> bins(n / local_sz);
     std::vector<int> offsets(n / local_sz);
     std::vector<float> result, result_gpu;
     result.reserve(n);
     result_gpu.reserve(n);
     cl::Kernel cnt_pos_kernel(opencl.program, "count_positive");
     cl::Kernel comp_partial_kernel(opencl.program, "compute_partial");
+    cl::Kernel scan_finish_kernel(opencl.program, "finish_scan");
     auto t0 = clock_type::now();
     filter(input, result, [] (float x) { return x > 0; }); // filter positive numbers
     auto t1 = clock_type::now();
     cl::Buffer d_input(opencl.queue, begin(input), end(input), false);
-    cl::Buffer d_bins(opencl.context, CL_MEM_READ_WRITE, bins.size()*sizeof(int));
-    cl::Buffer d_offsets(opencl.context, CL_MEM_READ_WRITE, bins.size()*sizeof(int));
+    cl::Buffer d_bins(opencl.context, CL_MEM_READ_WRITE, offsets.size()*sizeof(int));
+    cl::Buffer d_offsets(opencl.context, CL_MEM_READ_WRITE, offsets.size()*sizeof(int));
     opencl.queue.finish();
     cnt_pos_kernel.setArg(0, d_input);
-    cnt_pos_kernel.setArg(1, d_bins);
+    cnt_pos_kernel.setArg(1, d_offsets);
     opencl.queue.flush();
     auto t2 = clock_type::now();
     opencl.queue.enqueueNDRangeKernel(cnt_pos_kernel, cl::NullRange, cl::NDRange(n), cl::NDRange(local_sz));
     opencl.queue.finish();
 
-    comp_partial_kernel.setArg(0, d_bins);
-    comp_partial_kernel.setArg(1, d_offsets);
+    //comp_partial_kernel.setArg(0, d_bins);
+    comp_partial_kernel.setArg(0, d_offsets);
     opencl.queue.enqueueNDRangeKernel(comp_partial_kernel, cl::NullRange, cl::NDRange(n / local_sz), cl::NDRange(local_sz));
+    opencl.queue.finish();
 
+    scan_finish_kernel.setArg(0, d_offsets);
+    opencl.queue.enqueueNDRangeKernel(scan_finish_kernel, cl::NullRange, cl::NDRange(n / local_sz), cl::NDRange(local_sz));
     opencl.queue.finish();
     auto t3 = clock_type::now();
-    cl::copy(opencl.queue, d_bins, std::begin(bins), std::end(bins));
     cl::copy(opencl.queue, d_offsets, std::begin(offsets), std::end(offsets));
 
     auto t4 = clock_type::now();
@@ -137,15 +139,14 @@ kernel void count_positive(global const float *a,
     }
 }
 
-kernel void compute_partial(global const int *input,
-                    global int *result) {
+kernel void compute_partial(global int *result) {
     const int i = get_global_id(0);
     const int t = get_local_id(0);
     const int m = get_local_size(0);
 
     // move parts of array into local
     local int buff[BUFFSIZE];
-    buff[t] = input[i];
+    buff[t] = result[i];
     barrier(CLK_LOCAL_MEM_FENCE);
 
     int sum = buff[t];
@@ -161,6 +162,18 @@ kernel void compute_partial(global const int *input,
     result[i] = buff[t];
 }
 
+kernel void finish_scan(global int *result) {
+    const int k = get_group_id(0);
+    const int n = get_global_size(0);
+    const int t = get_local_id(0);
+    const int m = get_local_size(0);
+  
+    if (k == 0) {
+        for (int j = 1; j < n / m; j++) {
+            result[j * m + t] += result[j * m - 1];
+        }
+    }
+}
 )";
 
 int main() {
