@@ -65,18 +65,19 @@ void profile_filter(int n, OpenCL& opencl) {
     auto input = random_std_vector<float>(n);
     int local_sz = 256;
     std::vector<int> offsets(n / local_sz);
-    std::vector<float> result, result_gpu;
+    std::vector<float> result;
     result.reserve(n);
-    result_gpu.reserve(n);
+    std::vector<float> result_gpu(n);
     cl::Kernel cnt_pos_kernel(opencl.program, "count_positive");
     cl::Kernel comp_partial_kernel(opencl.program, "compute_partial");
     cl::Kernel scan_finish_kernel(opencl.program, "finish_scan");
+    cl::Kernel filter_kernel(opencl.program, "filter");
     auto t0 = clock_type::now();
     filter(input, result, [] (float x) { return x > 0; }); // filter positive numbers
     auto t1 = clock_type::now();
     cl::Buffer d_input(opencl.queue, begin(input), end(input), false);
-    cl::Buffer d_bins(opencl.context, CL_MEM_READ_WRITE, offsets.size()*sizeof(int));
     cl::Buffer d_offsets(opencl.context, CL_MEM_READ_WRITE, offsets.size()*sizeof(int));
+    cl::Buffer d_result(opencl.context, CL_MEM_READ_WRITE, input.size()*sizeof(float));
     opencl.queue.finish();
     cnt_pos_kernel.setArg(0, d_input);
     cnt_pos_kernel.setArg(1, d_offsets);
@@ -85,7 +86,6 @@ void profile_filter(int n, OpenCL& opencl) {
     opencl.queue.enqueueNDRangeKernel(cnt_pos_kernel, cl::NullRange, cl::NDRange(n), cl::NDRange(local_sz));
     opencl.queue.finish();
 
-    //comp_partial_kernel.setArg(0, d_bins);
     comp_partial_kernel.setArg(0, d_offsets);
     opencl.queue.enqueueNDRangeKernel(comp_partial_kernel, cl::NullRange, cl::NDRange(n / local_sz), cl::NDRange(local_sz));
     opencl.queue.finish();
@@ -93,10 +93,19 @@ void profile_filter(int n, OpenCL& opencl) {
     scan_finish_kernel.setArg(0, d_offsets);
     opencl.queue.enqueueNDRangeKernel(scan_finish_kernel, cl::NullRange, cl::NDRange(n / local_sz), cl::NDRange(local_sz));
     opencl.queue.finish();
+
+    filter_kernel.setArg(0, d_input);
+    filter_kernel.setArg(1, d_offsets);
+    filter_kernel.setArg(2, d_result);
+    opencl.queue.enqueueNDRangeKernel(filter_kernel, cl::NullRange, cl::NDRange(n), cl::NDRange(local_sz));
     auto t3 = clock_type::now();
     cl::copy(opencl.queue, d_offsets, std::begin(offsets), std::end(offsets));
+    int sz = offsets.back();
+    cl::copy(opencl.queue, d_result, std::begin(result_gpu), std::begin(result_gpu) + sz);
+    result_gpu.resize(sz);
 
     auto t4 = clock_type::now();
+
     verify_vector(result, result_gpu);
     print("filter", {t1-t0,t4-t1,t2-t1,t3-t2,t4-t3});
 }
@@ -110,13 +119,27 @@ void opencl_main(OpenCL& opencl) {
 const std::string src = R"(
 #define BUFFSIZE 1024
 kernel void filter(global const float *input,
-                    global int *res_size,
+                    global const int *offsets,
                     global float *result) {
-    const int i = get_global_id(0);
-    const int n = get_global_size(0);
+    const int m = get_local_size(0);
+    int k = get_group_id(0);
     int t = get_local_id(0);
-    if (i == 0)
-        res_size[0] = n;
+    local float buff[BUFFSIZE];
+
+    buff[t] = input[k * m + t];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    if (t == 0) {
+        int idx = 0;
+        if (k > 0)
+            idx = offsets[k - 1];
+        for (int j = 0; j < m; j++) {
+            if (buff[j] > 0) {
+                result[idx] = buff[j];
+                idx++;
+            }
+        }
+    }
 }
 
 kernel void count_positive(global const float *a,
@@ -167,10 +190,10 @@ kernel void finish_scan(global int *result) {
     const int n = get_global_size(0);
     const int t = get_local_id(0);
     const int m = get_local_size(0);
-  
     if (k == 0) {
         for (int j = 1; j < n / m; j++) {
             result[j * m + t] += result[j * m - 1];
+            barrier(CLK_GLOBAL_MEM_FENCE);
         }
     }
 }
